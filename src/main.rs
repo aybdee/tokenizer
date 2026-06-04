@@ -17,12 +17,19 @@ enum VocabKey {
 fn bpe_tokenizer<I: Iterator<Item = CompactString>>(lines: I) {
     let mut characters: AHashSet<char> = AHashSet::new();
     let mut vocab: AHashMap<VocabKey, usize> = AHashMap::new();
-    let mut corpus_map: AHashMap<Vec<usize>, usize> = AHashMap::new();
+    let mut corpus_map: AHashMap<CompactString, usize> = AHashMap::new();
     let re = Regex::new(r"\w+|[^\w\s]+").unwrap();
     let mut pair_counts: AHashMap<(usize, usize), usize> = AHashMap::new();
 
     for line in lines {
         for word in re.find_iter(&line).map(|m| m.as_str()) {
+            *corpus_map.entry(CompactString::from(word)).or_insert(0) += 1;
+        }
+    }
+
+    let mut corpus = corpus_map
+        .into_iter()
+        .map(|(word, count)| {
             let mut tokenized = vec![];
             for letter in word.chars() {
                 let inserted = characters.insert(letter);
@@ -35,24 +42,13 @@ fn bpe_tokenizer<I: Iterator<Item = CompactString>>(lines: I) {
                 }
             }
 
-            match corpus_map.get(&tokenized) {
-                Some(_) => {
-                    corpus_map.entry(tokenized).and_modify(|count| *count += 1);
-                }
-                None => {
-                    corpus_map.insert(tokenized, 1);
-                }
+            for (a, b) in tokenized.iter().zip(tokenized.iter().skip(1)) {
+                *pair_counts.entry((*a, *b)).or_insert(0) += count
             }
-        }
-    }
 
-    let mut corpus = corpus_map.into_iter().collect::<Vec<(_, _)>>();
-
-    for (word, count) in corpus.iter() {
-        for (a, b) in word.iter().zip(word.iter().skip(1)) {
-            *pair_counts.entry((*a, *b)).or_insert(0) += count
-        }
-    }
+            (tokenized, count)
+        })
+        .collect::<Vec<(_, _)>>();
 
     while vocab.len() < 50_000 {
         let Some((top_pair, top_pair_count)) = pair_counts
@@ -72,57 +68,55 @@ fn bpe_tokenizer<I: Iterator<Item = CompactString>>(lines: I) {
         let new_token = vocab.len() + 1;
         vocab.insert(VocabKey::Merged(top_pair), new_token);
 
-        corpus = corpus
-            .into_iter()
-            .map(|(word, count)| {
-                let mut letters = vec![];
-                let mut word_index = 0;
-                while word_index < word.len() {
-                    if word_index + 1 < word.len() {
-                        let a = &word[word_index];
-                        let b = &word[word_index + 1];
-                        if *a == top_pair.0 && *b == top_pair.1 {
-                            //handle LHS of merge
-                            if let Some(&prev) = letters.last() {
-                                // Decrement count of broken pair: (prev, top_pair.0)
-                                pair_counts
-                                    .entry((prev, word[word_index]))
-                                    .and_modify(|c| *c = c.saturating_sub(count));
-
-                                // Increment the new pair: (prev, new_token)
-                                *pair_counts.entry((prev, new_token)).or_insert(0) += count;
-                            }
-
-                            //decrement count of merged pair
+        for index in 0..corpus.len() {
+            let (word, count) = std::mem::take(&mut corpus[index]);
+            let mut letters = Vec::with_capacity(word.len());
+            let mut word_index = 0;
+            while word_index < word.len() {
+                if word_index + 1 < word.len() {
+                    let a = &word[word_index];
+                    let b = &word[word_index + 1];
+                    if *a == top_pair.0 && *b == top_pair.1 {
+                        //handle LHS of merge
+                        if let Some(&prev) = letters.last() {
+                            // Decrement count of broken pair: (prev, top_pair.0)
                             pair_counts
-                                .entry((word[word_index], word[word_index + 1]))
+                                .entry((prev, word[word_index]))
+                                .and_modify(|c| *c = c.saturating_sub(count));
+
+                            // Increment the new pair: (prev, new_token)
+                            *pair_counts.entry((prev, new_token)).or_insert(0) += count;
+                        }
+
+                        //decrement count of merged pair
+                        pair_counts
+                            .entry((word[word_index], word[word_index + 1]))
+                            .and_modify(|counter| *counter = counter.saturating_sub(count));
+
+                        //handle RHS of merge
+                        if word_index + 2 < word.len() {
+                            // Decrement count of broken pair: (top_pair.1, prev)
+                            pair_counts
+                                .entry((word[word_index + 1], word[word_index + 2]))
                                 .and_modify(|counter| *counter = counter.saturating_sub(count));
 
-                            //handle RHS of merge
-                            if word_index + 2 < word.len() {
-                                // Decrement count of broken pair: (top_pair.1, prev)
-                                pair_counts
-                                    .entry((word[word_index + 1], word[word_index + 2]))
-                                    .and_modify(|counter| *counter = counter.saturating_sub(count));
-
-                                // Increment the new pair: (new_token, prev)
-                                *pair_counts
-                                    .entry((new_token, word[word_index + 2]))
-                                    .or_insert(0) += count;
-                            }
-
-                            letters.push(new_token);
-                            word_index += 2;
-                            continue;
+                            // Increment the new pair: (new_token, prev)
+                            *pair_counts
+                                .entry((new_token, word[word_index + 2]))
+                                .or_insert(0) += count;
                         }
-                    }
-                    letters.push(word[word_index]);
-                    word_index += 1;
-                }
 
-                (letters, count)
-            })
-            .collect::<Vec<_>>();
+                        letters.push(new_token);
+                        word_index += 2;
+                        continue;
+                    }
+                }
+                letters.push(word[word_index]);
+                word_index += 1;
+            }
+
+            corpus[index] = (letters, count);
+        }
     }
 
     println!("{}", vocab.len());
@@ -145,8 +139,15 @@ fn hf_baseline<I: Iterator<Item = CompactString> + Send + Sync>(lines: I) {
 
 fn main() {
     tokenizers::utils::parallelism::set_parallelism(false);
-    let file = File::open("./data/file_min.txt").unwrap();
+    let file = File::open("./data/file.txt").unwrap();
     let reader = BufReader::new(file);
+
+    // hf_baseline(
+    //     reader
+    //         .lines()
+    //         .filter_map(Result::ok)
+    //         .map(CompactString::from),
+    // );
 
     bpe_tokenizer(
         reader
