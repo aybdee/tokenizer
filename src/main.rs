@@ -145,7 +145,7 @@ fn hf_baseline<I: Iterator<Item = CompactString> + Send + Sync>(lines: I) {
 
 fn main() {
     tokenizers::utils::parallelism::set_parallelism(false);
-    let file = File::open("./data/text.txt").unwrap();
+    let file = File::open("./data/file_min.txt").unwrap();
     let reader = BufReader::new(file);
 
     bpe_tokenizer(
